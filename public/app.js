@@ -675,6 +675,7 @@ function renderPublished() {
 
 document.getElementById('tabDraft').addEventListener('click', () => switchTab('draft'));
 document.getElementById('tabPublished').addEventListener('click', () => switchTab('published'));
+document.getElementById('tabQuarantine').addEventListener('click', () => switchTab('quarantine'));
 document.getElementById('tabProduction').addEventListener('click', () => switchTab('production'));
 document.getElementById('btnCreate').addEventListener('click', createDesign);
 document.getElementById('designSelect').addEventListener('change', (e) => loadDraft(Number(e.target.value)));
@@ -712,6 +713,7 @@ function switchTab(which) {
   document.getElementById('tabPrint').classList.toggle('active', which === 'print');
   document.getElementById('tabProduction').classList.toggle('active', which === 'production');
   document.getElementById('tabCutting').classList.toggle('active', which === 'cutting');
+  document.getElementById('tabQuarantine').classList.toggle('active', which === 'quarantine');
   document.getElementById('tabCombo').classList.toggle('active', which === 'combo');
   document.getElementById('tabStocktake').classList.toggle('active', which === 'stocktake');
   document.getElementById('tabIssue').classList.toggle('active', which === 'issue');
@@ -723,6 +725,7 @@ function switchTab(which) {
   document.getElementById('viewPrint').hidden = which !== 'print';
   document.getElementById('viewProduction').hidden = which !== 'production';
   document.getElementById('viewCutting').hidden = which !== 'cutting';
+  document.getElementById('viewQuarantine').hidden = which !== 'quarantine';
   document.getElementById('viewCombo').hidden = which !== 'combo';
   document.getElementById('viewStocktake').hidden = which !== 'stocktake';
   document.getElementById('viewIssue').hidden = which !== 'issue';
@@ -733,6 +736,7 @@ function switchTab(which) {
   if (which === 'print') enterPrint();
   if (which === 'production') enterProduction();
   if (which === 'cutting') enterCutting();
+  if (which === 'quarantine') enterQuarantine();
   if (which === 'combo') enterCombo();
   if (which === 'stocktake') enterStocktake();
   if (which === 'issue') enterIssue();
@@ -1704,7 +1708,7 @@ function renderGlassList() {
     el.innerHTML = '<div class="hint">尚未登记颜色原片。每种颜色仅可登记一种宽×高规格。</div>';
     return;
   }
-  let html = '<table><thead><tr><th>颜色</th><th class="num">宽×高</th><th class="num">库存</th><th class="num">已领</th><th class="num">未领预留</th><th class="num">可用</th><th></th></tr></thead><tbody>';
+  let html = '<table><thead><tr><th>颜色</th><th class="num">宽×高</th><th class="num">实物库存</th><th class="num">已领</th><th class="num">未领预留</th><th class="num">隔离</th><th class="num">实际可用</th><th></th></tr></thead><tbody>';
   for (const s of cut.sheets) {
     html += `<tr>
       <td><span class="color-chip" style="background:${s.color}"></span>${s.color}</td>
@@ -1712,11 +1716,12 @@ function renderGlassList() {
       <td class="num">${s.stock}</td>
       <td class="num">${s.picked || 0}</td>
       <td class="num">${s.reserved}</td>
+      <td class="num">${s.quarantined || 0}</td>
       <td class="num"><b>${s.available}</b></td>
       <td><input type="number" min="0" step="1" value="${s.stock}" class="glass-stock" data-id="${s.id}" style="width:72px"></td>
     </tr>`;
   }
-  html += '</tbody></table>';
+  html += '</tbody></table><div class="muted small">实际可用 = 实物库存 − 未领预留（净预留）− 隔离。瑕疵原片请到“原片隔离”标签划出。</div>';
   el.innerHTML = html;
   el.querySelectorAll('.glass-stock').forEach((inp) => {
     inp.addEventListener('change', () => updateGlassStock(Number(inp.dataset.id), Number(inp.value)));
@@ -2553,13 +2558,14 @@ function stRenderPicker() {
   if (!st.sheets.length) {
     glassEl.innerHTML = '<div class="hint">尚未登记玻璃原片（请到“玻璃裁片”登记）。</div>';
   } else {
-    glassEl.innerHTML = '<table><thead><tr><th></th><th>颜色</th><th class="num">库存/预留</th><th class="num">实盘</th></tr></thead><tbody>' +
+    glassEl.innerHTML = '<table><thead><tr><th></th><th>颜色</th><th class="num">实物/净预留/隔离</th><th class="num">实盘</th></tr></thead><tbody>' +
       st.sheets.map((s) => `<tr>
         <td><input type="checkbox" class="st-pick" data-type="glass" data-id="${s.id}"></td>
         <td><span class="color-chip" style="background:${s.color}"></span>${s.color} <span class="muted small">${s.width}×${s.height}</span></td>
-        <td class="num muted small">${s.stock} / ${s.reserved}</td>
+        <td class="num muted small">${s.stock} / ${s.reserved} / ${s.quarantined || 0}</td>
         <td><input type="number" min="0" step="1" value="${s.stock}" class="st-count" data-type="glass" data-id="${s.id}" style="width:80px"></td>
-      </tr>`).join('') + '</tbody></table>';
+      </tr>`).join('') + '</tbody></table>' +
+      '<div class="muted small">玻璃实盘总数不得低于“净预留 + 隔离”，否则确认时整单不生效。</div>';
   }
 }
 
@@ -2727,25 +2733,28 @@ function stRenderDetail(s) {
   }
   if (glassItems.length) {
     html += '<h3>玻璃原片</h3>' + tableHead([
-      { t: '颜色' }, { t: '系统库存(原)', num: 1 }, { t: '已确认预留', num: 1 },
+      { t: '颜色' }, { t: '系统库存(原)', num: 1 }, { t: '已确认净预留', num: 1 },
+      { t: '隔离', num: 1 },
       { t: '实盘总数', num: 1 }, { t: '差异', num: 1 }, { t: '实盘后可用', num: 1 },
     ]);
     for (const it of glassItems) {
+      const q = it.currentQuarantined ?? 0;
       html += `<tr${it.unavailable ? ' class="muted"' : ''}>
         <td><span class="color-chip" style="background:${it.color}"></span>${it.color}
           <span class="muted small">${it.width}×${it.height} mm</span></td>
         <td class="num">${it.stock}</td>
         <td class="num">${it.reserved}</td>
+        <td class="num">${q}</td>
         <td class="num"><b>${it.counted}</b></td>
         <td class="num">${stDiffCell(it.diff)}</td>
-        <td class="num"><b>${it.availableAfterCount}</b></td>
+        <td class="num"><b>${it.actualAvailableAfterCount ?? (it.counted - it.reserved - q)}</b></td>
       </tr>`;
     }
     html += '</tbody></table>';
   }
 
-  html += `<div class="hint small">系统库存/已确认预留/差异/实盘后可用量为<b>预览基准口径</b>（确认时即盘点口径）；
-    “实盘后可用 = 实盘总数 − 已确认预留”，独立计划、裁片订单与整套单随后按该口径计算。</div>`;
+  html += `<div class="hint small">系统库存/已确认预留/差异为<b>预览基准口径</b>（确认时即盘点口径）；
+    玻璃“实盘后可用 = 实盘总数 − 净预留 − 当前隔离余额”（隔离不随盘点变化），确认要求实盘数不低于净预留与隔离之和。</div>`;
 
   if (s.status === 'draft') {
     html += `<div class="btn-row">
@@ -2754,7 +2763,7 @@ function stRenderDetail(s) {
       <button id="btnStLoad">载入到左侧编辑</button>
       <button id="btnStDelete" class="danger">删除草稿</button>
     </div>
-    <div class="hint">确认在一个事务内完成：任一项系统库存/预留与预览基准不符，或实盘数低于当前预留，都会返回该项及原因，整单不生效。</div>`;
+    <div class="hint">确认在一个事务内完成：任一项系统库存/预留与预览基准不符，或玻璃实盘数低于当前净预留与隔离之和，都会返回该项及原因，整单不生效。</div>`;
   }
 
   el.innerHTML = html;
@@ -3061,22 +3070,31 @@ function ledgerDeltaHtml(n) {
 function ledgerRender() {
   const L = ledger.result;
   if (!L) return;
+  const isGlass = L.materialType === 'glass';
   document.getElementById('ledgerCurrentSection').hidden = false;
   document.getElementById('ledgerCurrent').innerHTML =
     `<div class="stock-badge ok">${escapeHtml(L.materialTypeText)} ${escapeHtml(L.specName)}
       <span class="muted small">${escapeHtml(L.specDetail)}</span><br>
-      实物库存 <b>${L.current.stock}</b> ${L.unit} · 净预留 <b>${L.current.reserved}</b> · 可用 <b>${L.current.available}</b>
+      实物库存 <b>${L.current.stock}</b> ${L.unit} · 净预留 <b>${L.current.reserved}</b>${
+        isGlass ? ` · 隔离 <b>${L.current.quarantined}</b>` : ''
+      } · 实际可用 <b>${L.current.available}</b>
     </div>`;
   const el = document.getElementById('ledgerTable');
   if (!L.entries.length) {
     el.innerHTML = '<div class="hint">该条件下暂无台账记录（换个时间范围或规格试试）。</div>';
     return;
   }
-  let html = `<div class="hint">共 ${L.count} 笔，按发生顺序排列；笔后余额可与当前结存逐笔核对。</div>
+  let html = `<div class="hint">共 ${L.count} 笔，按发生顺序排列；笔后余额可与当前结存逐笔核对。${
+    isGlass ? '玻璃原片另列隔离增减与笔后隔离余额（隔离不动实物库存与净预留）。' : ''
+  }</div>
     <table><thead><tr>
       <th>#</th><th>发生时间</th><th>业务来源</th><th>事件</th>
-      <th class="num">实物增减</th><th class="num">净预留增减</th>
-      <th class="num">笔后实物</th><th class="num">笔后净预留</th>
+      <th class="num">实物增减</th><th class="num">净预留增减</th>${
+        isGlass ? '<th class="num">隔离增减</th>' : ''
+      }
+      <th class="num">笔后实物</th><th class="num">笔后净预留</th>${
+        isGlass ? '<th class="num">笔后隔离</th>' : ''
+      }
     </tr></thead><tbody>`;
   for (const e of L.entries) {
     html += `<tr>
@@ -3086,8 +3104,10 @@ function ledgerRender() {
       <td>${escapeHtml(e.eventText)}</td>
       ${ledgerDeltaHtml(e.deltaStock)}
       ${ledgerDeltaHtml(e.deltaReserved)}
+      ${isGlass ? ledgerDeltaHtml(e.deltaQuarantined || 0) : ''}
       <td class="num"><b>${e.balanceStock}</b></td>
       <td class="num"><b>${e.balanceReserved}</b></td>
+      ${isGlass ? `<td class="num"><b>${e.balanceQuarantined || 0}</b></td>` : ''}
     </tr>`;
   }
   html += '</tbody></table>';
@@ -3515,3 +3535,164 @@ document.getElementById('btnReusePreview').addEventListener('click', () => {
   reuseRunPreview().catch((e) => reuseBanner('error', '⛔ ' + (e.data?.error || e.message)));
 });
 
+
+// ================= 玻璃原片隔离（瑕疵划出 / 解除） =================
+
+const quarantineState = { sheets: [] };
+
+function quarantineOpNoNow() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `Q-${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+async function enterQuarantine() {
+  await quarantineLoadAll();
+  const opNoInput = document.getElementById('quarantineOpNo');
+  if (!opNoInput.value) opNoInput.value = quarantineOpNoNow();
+}
+
+async function quarantineLoadAll() {
+  const data = await api('GET', '/api/glass-quarantines/balances');
+  quarantineState.sheets = data.balances;
+  quarantineRenderBalances();
+  quarantineRenderInputs();
+  quarantineRenderFilter();
+  await quarantineLoadHistory();
+}
+
+function quarantineRenderBalances() {
+  const el = document.getElementById('quarantineBalances');
+  if (!quarantineState.sheets.length) {
+    el.innerHTML = '<div class="hint">尚未登记任何颜色原片，请到“玻璃裁片”标签登记。</div>';
+    return;
+  }
+  let html = '<table><thead><tr><th>颜色</th><th class="num">宽×高</th><th class="num">实物库存</th><th class="num">净预留</th><th class="num">隔离余额</th><th class="num">实际可用</th></tr></thead><tbody>';
+  for (const s of quarantineState.sheets) {
+    html += `<tr>
+      <td><span class="color-chip" style="background:${s.color}"></span>${s.color}</td>
+      <td class="num">${s.width}×${s.height}</td>
+      <td class="num">${s.stock}</td>
+      <td class="num">${s.reserved}</td>
+      <td class="num">${s.quarantined}</td>
+      <td class="num"><b>${s.available}</b></td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  html += '<div class="muted small">实物库存不因隔离变化；实际可用 = 实物库存 − 净预留 − 隔离，新裁片订单与整套单按此口径预留。</div>';
+  el.innerHTML = html;
+}
+
+function quarantineRenderInputs() {
+  const el = document.getElementById('quarantineInputs');
+  if (!quarantineState.sheets.length) { el.innerHTML = ''; return; }
+  let html = '<table><thead><tr><th>勾选</th><th>颜色</th><th class="num">实物/净预留/隔离/可用</th><th class="num">本次张数（正整数）</th></tr></thead><tbody>';
+  for (const s of quarantineState.sheets) {
+    html += `<tr>
+      <td><input type="checkbox" class="q-pick" data-id="${s.id}"></td>
+      <td><span class="color-chip" style="background:${s.color}"></span>${s.color}</td>
+      <td class="num muted small">${s.stock} / ${s.reserved} / ${s.quarantined} / ${s.available}</td>
+      <td class="num"><input type="number" min="1" step="1" value="1" class="q-count" data-id="${s.id}" style="width:88px" disabled></td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  el.innerHTML = html;
+  el.querySelectorAll('.q-pick').forEach((box) => {
+    box.addEventListener('change', () => {
+      const inp = el.querySelector(`.q-count[data-id="${box.dataset.id}"]`);
+      inp.disabled = !box.checked;
+      if (box.checked) inp.focus();
+    });
+  });
+}
+
+function quarantineRenderFilter() {
+  const sel = document.getElementById('quarantineFilter');
+  const prev = sel.value;
+  sel.innerHTML = '<option value="">全部颜色</option>' + quarantineState.sheets
+    .map((s) => `<option value="${s.color}">${s.color}</option>`).join('');
+  if ([...sel.options].some((o) => o.value === prev)) sel.value = prev;
+}
+
+function quarantineCollectSelection() {
+  const el = document.getElementById('quarantineInputs');
+  const items = [];
+  el.querySelectorAll('.q-pick').forEach((box) => {
+    if (!box.checked) return;
+    const inp = el.querySelector(`.q-count[data-id="${box.dataset.id}"]`);
+    items.push({ sheetId: Number(box.dataset.id), count: Number(inp.value) });
+  });
+  return items;
+}
+
+async function quarantineSubmit() {
+  const msg = document.getElementById('quarantineMsg');
+  const action = document.getElementById('quarantineAction').value;
+  const opNo = document.getElementById('quarantineOpNo').value.trim();
+  const reason = document.getElementById('quarantineReason').value.trim();
+  const items = quarantineCollectSelection();
+  try {
+    const r = await api('POST', '/api/glass-quarantines', { opNo, action, reason, items });
+    msg.textContent = r.idempotent
+      ? `✓ 操作号 ${opNo} 已提交过且内容一致，返回原记录，未重复改动`
+      : `✓ 已${action === 'quarantine' ? '隔离' : '解除隔离'} ${r.quarantine.items.length} 个颜色（操作号 ${opNo}）`;
+    document.getElementById('quarantineReason').value = '';
+    document.querySelectorAll('#quarantineInputs .q-pick').forEach((b) => { b.checked = false; });
+    document.querySelectorAll('#quarantineInputs .q-count').forEach((i) => { i.disabled = true; i.value = 1; });
+    document.getElementById('quarantineOpNo').value = quarantineOpNoNow();
+    await quarantineLoadAll();
+  } catch (err) {
+    let text = '⛔ ' + err.message;
+    if (err.data?.problems) {
+      text += '：' + err.data.problems.map((p) => `${p.color}（${p.message}）`).join('；');
+    }
+    msg.textContent = text;
+  }
+}
+
+async function quarantineLoadHistory() {
+  const el = document.getElementById('quarantineHistory');
+  const color = document.getElementById('quarantineFilter').value;
+  let history;
+  try {
+    history = await api('GET', '/api/glass-quarantines' + (color ? `?color=${encodeURIComponent(color)}` : ''));
+  } catch (err) {
+    el.innerHTML = '<div class="hint">⛔ ' + err.message + '</div>';
+    return;
+  }
+  if (!history.quarantines.length) {
+    el.innerHTML = '<div class="hint">暂无隔离记录。</div>';
+    return;
+  }
+  el.innerHTML = history.quarantines.map((op) => {
+    const isQ = op.action === 'quarantine';
+    const rows = op.items.map((it) => `<tr>
+      <td><span class="color-chip" style="background:${it.color}"></span>${it.color}</td>
+      <td class="num">${it.width}×${it.height}</td>
+      <td class="num" style="color:${isQ ? '#c62828' : '#2e7d32'}">${isQ ? '+' : '−'}${it.count}</td>
+      <td class="num">${it.balance}</td>
+    </tr>`).join('');
+    return `<details class="q-record"><summary>
+      <b>${isQ ? '🚧 隔离' : '✅ 解除隔离'}</b>
+      <code>${op.opNo}</code>
+      <span class="muted small">${op.createdAt}</span>
+      <span class="muted small">${escapeHtml(op.reason)}</span>
+    </summary>
+    <table><thead><tr><th>颜色</th><th class="num">规格</th><th class="num">本笔增减</th><th class="num">笔后隔离余额</th></tr></thead>
+    <tbody>${rows}</tbody></table></details>`;
+  }).join('');
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+document.getElementById('btnQuarantineSubmit').addEventListener('click', () => {
+  quarantineSubmit().catch((e) => {
+    document.getElementById('quarantineMsg').textContent = '⛔ ' + (e.data?.error || e.message);
+  });
+});
+document.getElementById('btnQuarantineNewNo').addEventListener('click', () => {
+  document.getElementById('quarantineOpNo').value = quarantineOpNoNow();
+});
+document.getElementById('quarantineFilter').addEventListener('change', quarantineLoadHistory);

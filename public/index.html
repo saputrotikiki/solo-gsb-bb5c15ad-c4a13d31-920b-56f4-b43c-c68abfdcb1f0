@@ -17,6 +17,7 @@
       <button id="tabPrint" class="tab">分张打印</button>
       <button id="tabProduction" class="tab">铅条生产</button>
       <button id="tabCutting" class="tab">玻璃裁片</button>
+      <button id="tabQuarantine" class="tab">原片隔离</button>
       <button id="tabCombo" class="tab">整套备料</button>
       <button id="tabStocktake" class="tab">库存盘点</button>
       <button id="tabIssue" class="tab">领料</button>
@@ -392,6 +393,51 @@
       <div id="cutPreviewBox" class="lead-panel">
         <h2>排样预览 / 订单详情</h2>
         <div id="cutPreviewContent" class="hint">在左侧登记各颜色原片，选择发布版本、制作件数与片间最小间距，点击“排样预览”。</div>
+      </div>
+    </section>
+  </main>
+
+  <!-- ============ 原片隔离视图 ============ -->
+  <main id="viewQuarantine" class="view" hidden>
+    <aside class="panel">
+      <section>
+        <h2>① 各色隔离余额 / 实际可用量</h2>
+        <div class="hint">隔离只划出<b>当前未预留且未隔离</b>的瑕疵实物：实物库存不变，但新裁片订单与整套单的可用量会扣除隔离量；已确认单据仍可按原预留领料。解除不得超过隔离余额。</div>
+        <div id="quarantineBalances"></div>
+      </section>
+
+      <section>
+        <h2>② 提交隔离 / 解除隔离</h2>
+        <label>操作类型
+          <select id="quarantineAction">
+            <option value="quarantine">隔离划出（瑕疵原片）</option>
+            <option value="release">解除隔离（复检合格）</option>
+          </select>
+        </label>
+        <label>唯一操作号
+          <input id="quarantineOpNo" type="text" placeholder="如 Q-20261005-001" maxlength="80">
+        </label>
+        <label>原因（必填）
+          <input id="quarantineReason" type="text" placeholder="如：第 3 箱表面划痕" maxlength="200">
+        </label>
+        <div class="hint">勾选一个或多个<b>已登记颜色</b>并填写各色正整数张数；任一颜色余额不足则整次不生效。同操作号重试返回原记录，换内容报冲突。</div>
+        <div id="quarantineInputs"></div>
+        <div class="btn-row">
+          <button id="btnQuarantineSubmit" class="primary big">原子提交（同事务写记录+台账）</button>
+          <button id="btnQuarantineNewNo">生成操作号</button>
+        </div>
+        <div id="quarantineMsg" class="hint"></div>
+      </section>
+    </aside>
+
+    <section class="canvas-wrap">
+      <div id="quarantineBanner" class="banner" hidden></div>
+      <div class="lead-panel">
+        <h2>隔离历史（不可变记录）</h2>
+        <label>按颜色筛选
+          <select id="quarantineFilter"><option value="">全部颜色</option></select>
+        </label>
+        <div id="quarantineHistory" class="hint">提交隔离或解除操作后，在此查看不可变历史与各色笔后隔离余额。</div>
       </div>
     </section>
   </main>

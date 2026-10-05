@@ -264,6 +264,39 @@ function init(dbPath) {
 
     CREATE INDEX IF NOT EXISTS idx_pieceimports_design ON piece_imports(target_design_id);
     CREATE INDEX IF NOT EXISTS idx_pieceimports_status ON piece_imports(status);
+
+    -- 玻璃原片隔离单：发现原片瑕疵时把若干颜色的正整数张数划出（quarantine）或解除（release）。
+    -- 隔离不改变实物库存 glass_sheets.stock，只占用“未预留且未隔离”的自由实物；
+    -- 解除不超过当前隔离余额。记录只追加、不可变、不可删除。
+    -- op_no 为调用方提供的唯一操作号：同号同内容重试返回原记录，同号不同内容冲突。
+    -- 一次操作可含多色（多行同一 op_no），故 op_no 不加 UNIQUE；由 BEGIN IMMEDIATE 写事务查重。
+    CREATE TABLE IF NOT EXISTS glass_quarantine_ops (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      op_no       TEXT    NOT NULL,
+      action      TEXT    NOT NULL CHECK (action IN ('quarantine','release')),
+      reason      TEXT    NOT NULL,
+      created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_quarantine_no   ON glass_quarantine_ops(op_no);
+    CREATE INDEX IF NOT EXISTS idx_quarantine_time ON glass_quarantine_ops(created_at);
+
+    -- 隔离单分色明细：delta>0 隔离张数，delta<0 解除张数；
+    -- balance 为该色本笔后的隔离余额（同色多行按操作顺序可逐笔核对）。
+    -- 颜色/宽高为操作时快照，便于规格将来变化时仍可追溯。
+    CREATE TABLE IF NOT EXISTS glass_quarantine_items (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      op_id       INTEGER NOT NULL REFERENCES glass_quarantine_ops(id),
+      sheet_id    INTEGER NOT NULL,
+      sheet_color TEXT    NOT NULL,
+      sheet_width_mm  INTEGER NOT NULL,
+      sheet_height_mm INTEGER NOT NULL,
+      delta       INTEGER NOT NULL CHECK (delta <> 0),
+      balance     INTEGER NOT NULL CHECK (balance >= 0)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_quarantine_items_op    ON glass_quarantine_items(op_id);
+    CREATE INDEX IF NOT EXISTS idx_quarantine_items_sheet ON glass_quarantine_items(sheet_id);
   `);
 
   // 旧库迁移：早期 cut_orders 的状态 CHECK 不含 'replaced'，也没有 replaced_at 列。
@@ -289,67 +322,122 @@ function init(dbPath) {
   return db;
 }
 
-// 库存台账（stock_ledger）：按“材料类型 + 规格”逐笔记录实物库存与净预留的增减及笔后余额。
+// 库存台账（stock_ledger）：按“材料类型 + 规格”逐笔记录实物库存、净预留与隔离量的增减及笔后余额。
 // 首次启用（旧库升级）时建表，并按各规格当前实物库存与净预留写 baseline 基线行
 // （旧业务不倒推）；全新库没有任何规格则不写基线，新登记规格从 register 流水起账。
-// 建表与基线写在同一事务，避免半截状态；表已存在则什么都不做。
+// 建表与基线写在同一事务，避免半截状态；表已存在则按需补隔离列。
 function migrateLedger() {
   const existed = db.prepare("SELECT 1 AS x FROM sqlite_master WHERE type='table' AND name='stock_ledger'").get();
-  if (existed) return;
-  const txn = db.transaction(() => {
+  if (!existed) {
+    const txn = db.transaction(() => {
+      db.exec(`
+        CREATE TABLE stock_ledger (
+          id               INTEGER PRIMARY KEY AUTOINCREMENT,
+          material_type    TEXT    NOT NULL CHECK (material_type IN ('lead','glass')),
+          spec_id          INTEGER NOT NULL,           -- lead_materials.id 或 glass_sheets.id
+          spec_name        TEXT    NOT NULL,           -- 规格名快照（铅条规格名 / 玻璃颜色）
+          event_type       TEXT    NOT NULL CHECK (event_type IN (
+            'baseline','register','adjust',
+            'plan_confirm','plan_cancel',
+            'order_confirm','order_cancel',
+            'replace_out','replace_in',
+            'combo_confirm','combo_cancel',
+            'stocktake','issue',
+            'quarantine','release_quarantine')),
+          delta_stock      INTEGER NOT NULL,           -- 实物库存增减（正=入/增，负=出/减）
+          delta_reserved   INTEGER NOT NULL,           -- 净预留增减（已确认预留 − 已领出）
+          delta_quarantined INTEGER NOT NULL DEFAULT 0,-- 隔离量增减（仅玻璃：正=隔离，负=解除）
+          balance_stock    INTEGER NOT NULL,           -- 笔后实物库存
+          balance_reserved INTEGER NOT NULL,           -- 笔后净预留
+          balance_quarantined INTEGER NOT NULL DEFAULT 0, -- 笔后隔离余额（仅玻璃，铅条恒 0）
+          source_type      TEXT    NOT NULL,           -- system/material/glass_sheet/lead_plan/cut_order/combo/stocktake/issue/quarantine
+          source_id        INTEGER,                    -- 业务单据 id（领料为 stock_issues 行 id，隔离为隔离单 id）
+          source_label     TEXT    NOT NULL,           -- 业务来源展示文本
+          created_at       TEXT    NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX idx_ledger_spec ON stock_ledger(material_type, spec_id, id);
+        CREATE INDEX idx_ledger_time ON stock_ledger(created_at);
+      `);
+      for (const m of db.prepare('SELECT id FROM lead_materials ORDER BY id').all()) {
+        writeLedgerRow({
+          materialType: 'lead', specId: m.id, eventType: 'baseline',
+          deltaStock: 0, deltaReserved: 0,
+          sourceType: 'system', sourceId: null,
+          sourceLabel: '启用台账基线（按当前实物库存与净预留起账，此前业务不倒推）',
+        });
+      }
+      for (const s of db.prepare('SELECT id FROM glass_sheets ORDER BY id').all()) {
+        writeLedgerRow({
+          materialType: 'glass', specId: s.id, eventType: 'baseline',
+          deltaStock: 0, deltaReserved: 0,
+          sourceType: 'system', sourceId: null,
+          sourceLabel: '启用台账基线（按当前实物库存与净预留起账，此前业务不倒推）',
+        });
+      }
+    });
+    txn.immediate();
+    return;
+  }
+  // 旧库升级：补“隔离量”两列与隔离事件类型（CHECK 不能直接改，按 SQLite 官方流程重建）。
+  const cols = db.prepare('PRAGMA table_info(stock_ledger)').all().map((c) => c.name);
+  const ddl = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='stock_ledger'").get().sql;
+  if (cols.includes('delta_quarantined') && /release_quarantine/.test(ddl)) return;
+  db.exec('BEGIN');
+  try {
     db.exec(`
+      ALTER TABLE stock_ledger RENAME TO stock_ledger_old;
       CREATE TABLE stock_ledger (
         id               INTEGER PRIMARY KEY AUTOINCREMENT,
         material_type    TEXT    NOT NULL CHECK (material_type IN ('lead','glass')),
-        spec_id          INTEGER NOT NULL,           -- lead_materials.id 或 glass_sheets.id
-        spec_name        TEXT    NOT NULL,           -- 规格名快照（铅条规格名 / 玻璃颜色）
+        spec_id          INTEGER NOT NULL,
+        spec_name        TEXT    NOT NULL,
         event_type       TEXT    NOT NULL CHECK (event_type IN (
           'baseline','register','adjust',
           'plan_confirm','plan_cancel',
           'order_confirm','order_cancel',
           'replace_out','replace_in',
           'combo_confirm','combo_cancel',
-          'stocktake','issue')),
-        delta_stock      INTEGER NOT NULL,           -- 实物库存增减（正=入/增，负=出/减）
-        delta_reserved   INTEGER NOT NULL,           -- 净预留增减（已确认预留 − 已领出）
-        balance_stock    INTEGER NOT NULL,           -- 笔后实物库存
-        balance_reserved INTEGER NOT NULL,           -- 笔后净预留
-        source_type      TEXT    NOT NULL,           -- system/material/glass_sheet/lead_plan/cut_order/combo/stocktake/issue
-        source_id        INTEGER,                    -- 业务单据 id（领料为 stock_issues 行 id）
-        source_label     TEXT    NOT NULL,           -- 业务来源展示文本
+          'stocktake','issue',
+          'quarantine','release_quarantine')),
+        delta_stock      INTEGER NOT NULL,
+        delta_reserved   INTEGER NOT NULL,
+        delta_quarantined INTEGER NOT NULL DEFAULT 0,
+        balance_stock    INTEGER NOT NULL,
+        balance_reserved INTEGER NOT NULL,
+        balance_quarantined INTEGER NOT NULL DEFAULT 0,
+        source_type      TEXT    NOT NULL,
+        source_id        INTEGER,
+        source_label     TEXT    NOT NULL,
         created_at       TEXT    NOT NULL DEFAULT (datetime('now'))
       );
-      CREATE INDEX idx_ledger_spec ON stock_ledger(material_type, spec_id, id);
-      CREATE INDEX idx_ledger_time ON stock_ledger(created_at);
+      INSERT INTO stock_ledger
+        (id, material_type, spec_id, spec_name, event_type, delta_stock, delta_reserved,
+         delta_quarantined, balance_stock, balance_reserved, balance_quarantined,
+         source_type, source_id, source_label, created_at)
+      SELECT id, material_type, spec_id, spec_name, event_type, delta_stock, delta_reserved,
+         0, balance_stock, balance_reserved, 0,
+         source_type, source_id, source_label, created_at
+      FROM stock_ledger_old;
+      DROP TABLE stock_ledger_old;
+      CREATE INDEX IF NOT EXISTS idx_ledger_spec ON stock_ledger(material_type, spec_id, id);
+      CREATE INDEX IF NOT EXISTS idx_ledger_time ON stock_ledger(created_at);
     `);
-    for (const m of db.prepare('SELECT id FROM lead_materials ORDER BY id').all()) {
-      writeLedgerRow({
-        materialType: 'lead', specId: m.id, eventType: 'baseline',
-        deltaStock: 0, deltaReserved: 0,
-        sourceType: 'system', sourceId: null,
-        sourceLabel: '启用台账基线（按当前实物库存与净预留起账，此前业务不倒推）',
-      });
-    }
-    for (const s of db.prepare('SELECT id FROM glass_sheets ORDER BY id').all()) {
-      writeLedgerRow({
-        materialType: 'glass', specId: s.id, eventType: 'baseline',
-        deltaStock: 0, deltaReserved: 0,
-        sourceType: 'system', sourceId: null,
-        sourceLabel: '启用台账基线（按当前实物库存与净预留起账，此前业务不倒推）',
-      });
-    }
-  });
-  txn.immediate();
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
+  }
 }
 
 // 台账写入：必须在业务变更的同一事务内、且业务变更已应用之后调用。
-// 笔后余额直接取该规格当前实物库存与净预留（变更后的真实值），
+// 笔后余额直接取该规格当前实物库存、净预留与隔离余额（变更后的真实值），
 // 因此同一规格逐笔按 id 顺序核对（上笔余额 + 本笔增减 = 本笔余额）恒成立。
 function writeLedgerRow(e) {
   const d = getDb();
   let specName;
   let stock;
   let reserved;
+  let quarantined = 0;
   if (e.materialType === 'lead') {
     const m = d.prepare('SELECT name, stock FROM lead_materials WHERE id = ?').get(e.specId);
     specName = m.name;
@@ -360,13 +448,16 @@ function writeLedgerRow(e) {
     specName = s.color;
     stock = s.stock;
     reserved = glassNetReservedInTx(e.specId);
+    quarantined = glassQuarantinedInTx(e.specId);
   }
   d.prepare(`INSERT INTO stock_ledger
     (material_type, spec_id, spec_name, event_type, delta_stock, delta_reserved,
-     balance_stock, balance_reserved, source_type, source_id, source_label)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+     delta_quarantined, balance_stock, balance_reserved, balance_quarantined,
+     source_type, source_id, source_label)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
     .run(e.materialType, e.specId, specName, e.eventType, e.deltaStock, e.deltaReserved,
-      stock, reserved, e.sourceType, e.sourceId ?? null, e.sourceLabel);
+      e.deltaQuarantined || 0, stock, reserved, quarantined,
+      e.sourceType, e.sourceId ?? null, e.sourceLabel);
 }
 
 // 旧库迁移：stock_issues.issue_no 早期为 UNIQUE，重建为普通列 + 索引（唯一性改由写事务保证）。
@@ -881,7 +972,33 @@ function deletePlan(id) {
 
 // ---------- 彩色玻璃原片 ----------
 
-function rowToGlassSheet(row, reserved = 0) {
+// 某玻璃颜色当前隔离余额（隔离 − 解除），由不可变隔离明细实时汇总。
+// 隔离是与“实物库存/净预留”并列的第三口径：实物库存不因隔离变化，
+// 但隔离张数既不能被新单据预留，也不能被手工调库/盘点冲减。
+function glassQuarantinedMap() {
+  const rows = getDb()
+    .prepare(`SELECT sheet_id AS id, COALESCE(SUM(delta), 0) AS quarantined
+              FROM glass_quarantine_items GROUP BY sheet_id`)
+    .all();
+  const m = new Map();
+  for (const r of rows) m.set(r.id, r.quarantined);
+  return m;
+}
+
+function glassQuarantined(sheetId) {
+  return getDb()
+    .prepare('SELECT COALESCE(SUM(delta),0) AS n FROM glass_quarantine_items WHERE sheet_id = ?')
+    .get(sheetId).n;
+}
+
+// 事务内：某玻璃规格当前隔离余额（隔离业务在写事务内调用）
+function glassQuarantinedInTx(sheetId) {
+  return getDb()
+    .prepare('SELECT COALESCE(SUM(delta),0) AS n FROM glass_quarantine_items WHERE sheet_id = ?')
+    .get(sheetId).n;
+}
+
+function rowToGlassSheet(row, reserved = 0, quarantined = 0) {
   return {
     id: row.id,
     color: row.color,
@@ -889,7 +1006,9 @@ function rowToGlassSheet(row, reserved = 0) {
     height: row.height_mm,
     stock: row.stock,
     reserved,
-    available: row.stock - reserved,
+    quarantined,                                    // 已隔离瑕疵张数（实物仍在库，不可用）
+    available: row.stock - reserved - quarantined,  // 实际可用量 = 实物库存 − 净预留 − 隔离
+    free: row.stock - reserved - quarantined,       // 可再隔离/可预留的自由实物
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -923,11 +1042,13 @@ function glassPickedMap() {
 function listGlassSheets() {
   const reserved = glassReservedMap();
   const picked = glassPickedMap();
+  const quarantined = glassQuarantinedMap();
   return getDb().prepare('SELECT * FROM glass_sheets ORDER BY color').all()
     .map((r) => {
       const gross = reserved.get(r.id) || 0;
       const got = picked.get(r.id) || 0;
-      const s = rowToGlassSheet(r, gross - got);
+      const q = quarantined.get(r.id) || 0;
+      const s = rowToGlassSheet(r, gross - got, q);
       s.grossReserved = gross;
       s.picked = got;
       s.remainingReserved = gross - got;
@@ -958,7 +1079,8 @@ function getGlassSheet(id) {
               FROM cut_order_items i JOIN cut_orders o ON o.id = i.order_id
               WHERE i.sheet_id = ? AND o.status = 'confirmed'`).get(id).n;
   const picked = glassPickedForSheet(id);
-  const s = rowToGlassSheet(row, gross - picked); // reserved=尚未领出的预留量（净预留）
+  const q = glassQuarantined(id);
+  const s = rowToGlassSheet(row, gross - picked, q); // reserved=尚未领出的预留量（净预留）
   s.grossReserved = gross;
   s.picked = picked;
   s.remainingReserved = gross - picked;
@@ -984,7 +1106,7 @@ function createGlassSheet({ color, width, height, stock }) {
   return getGlassSheet(id);
 }
 
-// 仅允许调整库存张数（颜色/宽高均属规格身份）；库存不得低于已确认订单预留。
+// 仅允许调整库存张数（颜色/宽高均属规格身份）；实物库存不得低于 净预留 + 隔离量。
 function updateGlassSheetStock(id, stock) {
   const d = getDb();
   const txn = d.transaction(() => {
@@ -995,7 +1117,11 @@ function updateGlassSheetStock(id, stock) {
                 FROM cut_order_items i JOIN cut_orders o ON o.id = i.order_id
                 WHERE i.sheet_id = ? AND o.status = 'confirmed'`).get(id).n;
     const reserved = gross - glassPickedForSheet(id);
-    if (stock < reserved) return { code: 'stock_below_reserved', reserved };
+    const quarantined = glassQuarantinedInTx(id);
+    const floor = reserved + quarantined;
+    if (stock < floor) {
+      return { code: 'stock_below_reserved', reserved, quarantined, floor };
+    }
     d.prepare("UPDATE glass_sheets SET stock = ?, updated_at = datetime('now') WHERE id = ?").run(stock, id);
     // 手工调库：仅库存实际变化时记台账
     if (stock !== row.stock) {
@@ -1134,12 +1260,18 @@ function confirmCutOrder(id) {
         .prepare(`SELECT COALESCE(SUM(ci.required_sheets),0) AS n
                   FROM cut_order_items ci JOIN cut_orders co ON co.id = ci.order_id
                   WHERE ci.sheet_id = ? AND co.status = 'confirmed'`).get(it.sheet_id).n;
-      const available = sheet.stock - (gross - glassPickedForSheet(it.sheet_id));
+      const netReserved = gross - glassPickedForSheet(it.sheet_id);
+      const quarantined = glassQuarantinedInTx(it.sheet_id);
+      // 实际可预留 = 实物库存 − 净预留 − 已隔离瑕疵张数
+      const available = sheet.stock - netReserved - quarantined;
       if (it.required_sheets > available) {
         shortages.push({
           color: it.sheet_color,
           required: it.required_sheets,
           available,
+          stock: sheet.stock,
+          reserved: netReserved,
+          quarantined,
           shortage: it.required_sheets - available,
         });
       }
@@ -1282,18 +1414,31 @@ function replaceCutOrder(oldId, o) {
         d.exec('ROLLBACK');
         return { code: 'sheet_changed', color: it.color };
       }
-      const reservedOther = d
+      // 旧单退出后仍生效的净预留 = 其他已确认单预留 − 其他单已领出
+      // （旧单整体退出：其预留与已领出都不再占用；已领出实物已在领料时出库）
+      const grossOther = d
         .prepare(`SELECT COALESCE(SUM(ci.required_sheets),0) AS n
                   FROM cut_order_items ci JOIN cut_orders co ON co.id = ci.order_id
                   WHERE ci.sheet_id = ? AND co.status = 'confirmed' AND co.id <> ?`)
         .get(it.sheetId, oldId).n;
-      const availableAfterRelease = sheet.stock - reservedOther;
+      const pickedOther = d
+        .prepare(`SELECT COALESCE(SUM(si.sheets_count),0) AS n
+                  FROM stock_issues si
+                  WHERE si.sheet_id = ? AND si.order_id IS NOT NULL AND si.order_id <> ?`)
+        .get(it.sheetId, oldId).n;
+      const netOther = grossOther - pickedOther;
+      const quarantined = glassQuarantinedInTx(it.sheet_id);
+      // 计入旧单退出预留后的实际可用量：实物 − 其他单净预留 − 隔离
+      const availableAfterRelease = sheet.stock - netOther - quarantined;
       if (it.requiredSheets > availableAfterRelease) {
         shortages.push({
           color: it.color,
           required: it.requiredSheets,
           oldReserved: 0, // 下方统一回填旧单该色预留
           available: availableAfterRelease,
+          stock: sheet.stock,
+          reserved: netOther,
+          quarantined,
           shortage: it.requiredSheets - availableAfterRelease,
         });
       }
@@ -1465,11 +1610,14 @@ function createComboOrder(c) {
         .prepare(`SELECT COALESCE(SUM(ci.required_sheets),0) AS n
                   FROM cut_order_items ci JOIN cut_orders co ON co.id = ci.order_id
                   WHERE ci.sheet_id = ? AND co.status = 'confirmed'`).get(it.sheetId).n;
-      const available = sheet.stock - (gross - glassPickedForSheet(it.sheetId));
+      const netReserved = gross - glassPickedForSheet(it.sheetId);
+      const quarantined = glassQuarantinedInTx(it.sheetId);
+      const available = sheet.stock - netReserved - quarantined;
       if (it.requiredSheets > available) {
         glassShortages.push({
           color: it.color, required: it.requiredSheets,
-          available, shortage: it.requiredSheets - available,
+          available, stock: sheet.stock, reserved: netReserved, quarantined,
+          shortage: it.requiredSheets - available,
         });
       }
     }
@@ -1785,19 +1933,21 @@ function confirmStocktake(id) {
           continue;
         }
         const reserved = glassReservedFor(it.spec_id);
+        const quarantined = glassQuarantinedInTx(it.spec_id);
         if (s.stock !== it.baseline_stock) {
           problems.push(problem(it, 'stock_changed', '系统库存与预览基准不一致（预览后库存已变动）',
-            { currentStock: s.stock, currentReserved: reserved }));
+            { currentStock: s.stock, currentReserved: reserved, currentQuarantined: quarantined }));
           continue;
         }
         if (reserved !== it.baseline_reserved) {
           problems.push(problem(it, 'reserved_changed', '已确认预留与预览基准不一致（预览后有订单确认或取消）',
-            { currentStock: s.stock, currentReserved: reserved }));
+            { currentStock: s.stock, currentReserved: reserved, currentQuarantined: quarantined }));
           continue;
         }
-        if (it.counted_stock < reserved) {
-          problems.push(problem(it, 'below_reserved', '实盘数低于当前已确认预留，不能按此盘点',
-            { currentStock: s.stock, currentReserved: reserved }));
+        if (it.counted_stock < reserved + quarantined) {
+          problems.push(problem(it, 'below_reserved',
+            '实盘数低于当前净预留与隔离量之和，不能按此盘点',
+            { currentStock: s.stock, currentReserved: reserved, currentQuarantined: quarantined }));
         }
       }
     }
@@ -2090,11 +2240,13 @@ function createStockIssue(p) {
         });
       }
       const netReserved = glassNetReservedInTx(sheetId);
-      if (sheet.stock < netReserved || sheet.stock < count) {
+      const quarantined = glassQuarantinedInTx(sheetId);
+      // 核心不变式：实物库存 ≥ 全部净预留 + 隔离量（count ≤ 本单剩余预留 ≤ 净预留，自动覆盖本次发放）
+      if (sheet.stock < netReserved + quarantined) {
         problems.push({
           kind: 'glass', color: item.sheet_color, sheetId, reason: 'physical_shortage',
-          stock: sheet.stock, requested: count,
-          message: `${item.sheet_color} 实物库存仅 ${sheet.stock} 张，不足以发放本次 ${count} 张`,
+          stock: sheet.stock, requested: count, netReserved, quarantined,
+          message: `${item.sheet_color} 实物库存仅 ${sheet.stock} 张，低于净预留 ${netReserved} 与隔离 ${quarantined} 之和，不能发放`,
         });
       }
     }
@@ -2238,6 +2390,192 @@ function listLedgerEntries({ materialType, specId, from = null, to = null }) {
   return getDb()
     .prepare(`SELECT * FROM stock_ledger WHERE ${where.join(' AND ')} ORDER BY id`)
     .all(...args);
+}
+
+// ---------- 玻璃原片隔离（瑕疵原片划出 / 解除隔离） ----------
+//
+// 口径：
+//   - 隔离（action='quarantine'）只能划出“当前未预留且未隔离”的自由实物，
+//     实物库存 glass_sheets.stock 不变化，只增加隔离余额；
+//   - 解除（action='release'）不得超过当前隔离余额，同样不改变实物库存；
+//   - 新裁片订单/整套单的可预留量 = 实物库存 − 净预留 − 隔离余额；
+//   - 确认、换单、领料、手工调库、盘点都守住 实物库存 ≥ 净预留 + 隔离。
+// 每次操作在一个 BEGIN IMMEDIATE 事务内原子写入不可变隔离记录与台账流水，
+// 同操作号同内容重试返回原记录，同号不同内容返回 op_no_conflict。
+
+function rowToQuarantineOp(row, itemRows) {
+  return {
+    id: row.id,
+    opNo: row.op_no,
+    action: row.action,
+    actionText: row.action === 'quarantine' ? '隔离' : '解除隔离',
+    reason: row.reason,
+    createdAt: row.created_at,
+    items: itemRows.map((it) => ({
+      sheetId: it.sheet_id,
+      color: it.sheet_color,
+      width: it.sheet_width_mm,
+      height: it.sheet_height_mm,
+      delta: it.delta,
+      count: Math.abs(it.delta),
+      balance: it.balance,
+    })),
+  };
+}
+
+function getQuarantineOpRowsByNo(opNo) {
+  return getDb().prepare('SELECT * FROM glass_quarantine_ops WHERE op_no = ? ORDER BY id').all(opNo);
+}
+
+function getQuarantineOpRow(id) {
+  return getDb().prepare('SELECT * FROM glass_quarantine_ops WHERE id = ?').get(id);
+}
+
+function listQuarantineItemRows(opId) {
+  return getDb().prepare('SELECT * FROM glass_quarantine_items WHERE op_id = ? ORDER BY id').all(opId);
+}
+
+function getQuarantineOp(id) {
+  const row = getQuarantineOpRow(id);
+  if (!row) return null;
+  return rowToQuarantineOp(row, listQuarantineItemRows(id));
+}
+
+function getQuarantineOpByNo(opNo) {
+  const rows = getQuarantineOpRowsByNo(opNo);
+  if (!rows.length) return null;
+  return rowToQuarantineOp(rows[0], listQuarantineItemRows(rows[0].id));
+}
+
+// 隔离历史（最新在前）；可按颜色（sheetId）过滤，from/to 为归一化时间边界。
+function listQuarantineOps({ sheetId = null, from = null, to = null } = {}) {
+  const where = [];
+  const args = [];
+  if (sheetId !== null) {
+    where.push('EXISTS (SELECT 1 FROM glass_quarantine_items qi WHERE qi.op_id = o.id AND qi.sheet_id = ?)');
+    args.push(sheetId);
+  }
+  if (from) { where.push('o.created_at >= ?'); args.push(from); }
+  if (to) { where.push('o.created_at <= ?'); args.push(to); }
+  const rows = getDb()
+    .prepare(`SELECT * FROM glass_quarantine_ops o ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY o.id DESC`)
+    .all(...args);
+  return rows.map((r) => rowToQuarantineOp(r, listQuarantineItemRows(r.id)));
+}
+
+// 从一组同号隔离明细行归纳“内容”（用于幂等/冲突比较）：
+// { action, items: Map(sheetId -> count) }
+function quarantineContentFromRows(opRows, itemRows) {
+  const items = new Map();
+  for (const it of itemRows) items.set(it.sheet_id, (items.get(it.sheet_id) || 0) + Math.abs(it.delta));
+  return { action: opRows[0].action, items };
+}
+
+function quarantineContentEqual(opRows, itemRows, p) {
+  if (opRows[0].action !== p.action) return false;
+  if (itemRows.length !== p.items.length) return false;
+  const c = quarantineContentFromRows(opRows, itemRows);
+  if (c.items.size !== p.items.length) return false;
+  for (const it of p.items) {
+    if (c.items.get(it.sheetId) !== it.count) return false;
+  }
+  return true;
+}
+
+// 隔离/解除确认：一个 BEGIN IMMEDIATE 事务内
+//   1) 同操作号已存在 → 内容相同幂等返回；不同返回 op_no_conflict；
+//   2) 逐色核对：颜色规格必须存在；隔离不得超过自由实物（stock − 净预留 − 已隔离），
+//      解除不得超过当前隔离余额；
+//   3) 任一颜色不足 → 整次不生效，回滚并返回各色余额与可划/可解量；
+//   4) 充足 → 原子写入不可变隔离单+明细，并同事务写台账（隔离列变动）。
+// p: { opNo, action:'quarantine'|'release', reason:string,
+//      items:[{sheetId, count}] }（调用方已校验非空、正整数、颜色不重复）
+function createGlassQuarantine(p) {
+  const d = getDb();
+  d.exec('BEGIN IMMEDIATE');
+  try {
+    // ---- 幂等 / 冲突 ----
+    const dupOps = d.prepare('SELECT * FROM glass_quarantine_ops WHERE op_no = ? ORDER BY id').all(p.opNo);
+    if (dupOps.length) {
+      d.exec('ROLLBACK');
+      const dupItems = d.prepare('SELECT * FROM glass_quarantine_items WHERE op_id = ? ORDER BY id')
+        .all(dupOps[0].id);
+      if (!quarantineContentEqual(dupOps, dupItems, p)) {
+        return { code: 'op_no_conflict', existing: quarantineContentFromRows(dupOps, dupItems) };
+      }
+      return { code: 'idempotent', op: rowToQuarantineOp(dupOps[0], dupItems) };
+    }
+
+    // ---- 逐色核对（事务内取当前真实余额）----
+    const problems = [];
+    const resolved = [];
+    for (const it of p.items) {
+      const sheet = getGlassSheetRow(it.sheetId);
+      if (!sheet) {
+        d.exec('ROLLBACK');
+        return { code: 'sheet_missing', sheetId: it.sheetId };
+      }
+      const netReserved = glassNetReservedInTx(it.sheetId);
+      const quarantined = glassQuarantinedInTx(it.sheetId);
+      if (p.action === 'quarantine') {
+        const free = sheet.stock - netReserved - quarantined;
+        if (it.count > free) {
+          problems.push({
+            sheetId: it.sheetId, color: sheet.color, action: 'quarantine',
+            count: it.count, stock: sheet.stock, reserved: netReserved,
+            quarantined, available: free,
+            shortage: it.count - free,
+            message: `${sheet.color} 自由实物仅 ${free} 张（实物 ${sheet.stock} − 净预留 ${netReserved} − 已隔离 ${quarantined}），不能隔离 ${it.count} 张`,
+          });
+        }
+      } else {
+        if (it.count > quarantined) {
+          problems.push({
+            sheetId: it.sheetId, color: sheet.color, action: 'release',
+            count: it.count, stock: sheet.stock, reserved: netReserved,
+            quarantined, available: quarantined,
+            shortage: it.count - quarantined,
+            message: `${sheet.color} 隔离余额仅 ${quarantined} 张，不能解除 ${it.count} 张`,
+          });
+        }
+      }
+      resolved.push({ sheet, netReserved, quarantined });
+    }
+    if (problems.length) {
+      d.exec('ROLLBACK');
+      return { code: 'quarantine_shortage', problems };
+    }
+
+    // ---- 写不可变隔离记录（实物库存不变）----
+    const info = d.prepare('INSERT INTO glass_quarantine_ops (op_no, action, reason) VALUES (?, ?, ?)')
+      .run(p.opNo, p.action, p.reason);
+    const opId = info.lastInsertRowid;
+    const insItem = d.prepare(`INSERT INTO glass_quarantine_items
+      (op_id, sheet_id, sheet_color, sheet_width_mm, sheet_height_mm, delta, balance)
+      VALUES (?, ?, ?, ?, ?, ?, ?)`);
+    const actionZh = p.action === 'quarantine' ? '隔离' : '解除隔离';
+    resolved.forEach((r, idx) => {
+      const it = p.items[idx];
+      const signed = p.action === 'quarantine' ? it.count : -it.count;
+      const balance = r.quarantined + signed;
+      insItem.run(opId, it.sheetId, r.sheet.color, r.sheet.width_mm, r.sheet.height_mm,
+        signed, balance);
+      // 台账：只动隔离量，实物库存与净预留不变（笔后余额取当前真实值）
+      writeLedgerRow({
+        materialType: 'glass', specId: it.sheetId,
+        eventType: p.action === 'quarantine' ? 'quarantine' : 'release_quarantine',
+        deltaStock: 0, deltaReserved: 0, deltaQuarantined: signed,
+        sourceType: 'quarantine', sourceId: opId,
+        sourceLabel: `原片${actionZh} ${p.opNo}（${p.reason}）：${r.sheet.color} ${actionZh} ${it.count} 张`,
+      });
+    });
+
+    d.exec('COMMIT');
+    return { code: 'ok', op: getQuarantineOp(opId) };
+  } catch (e) {
+    d.exec('ROLLBACK');
+    throw e;
+  }
 }
 
 // ---------- 跨图纸拼片复用 ----------
@@ -2387,6 +2725,9 @@ module.exports = {
   createPlan, getPlan, getPlanRow, listPlans, updatePlanDraft, confirmPlan, cancelPlan, deletePlan,
   listGlassSheets, glassSheetMapByColor, getGlassSheet, getGlassSheetRow, getGlassSheetByColorRow,
   createGlassSheet, updateGlassSheetStock,
+  glassQuarantined, glassQuarantinedMap, glassQuarantinedInTx,
+  createGlassQuarantine, getQuarantineOp, getQuarantineOpByNo, getQuarantineOpRowsByNo,
+  listQuarantineOps, listQuarantineItemRows, getQuarantineOpRow,
   createCutOrder, getCutOrder, getCutOrderRow, listCutOrders, listCutOrderItems, updateCutOrderDraft,
   confirmCutOrder, cancelCutOrder, deleteCutOrder,
   getReplacementByOldOrder, getReplacementByNewOrder, replaceCutOrder,
