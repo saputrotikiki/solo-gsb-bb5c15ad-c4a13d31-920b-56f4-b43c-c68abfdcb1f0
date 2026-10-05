@@ -20,6 +20,7 @@
       <button id="tabCombo" class="tab">整套备料</button>
       <button id="tabStocktake" class="tab">库存盘点</button>
       <button id="tabIssue" class="tab">领料</button>
+      <button id="tabQuarantine" class="tab">瑕疵隔离</button>
       <button id="tabLedger" class="tab">库存台账</button>
     </nav>
   </header>
@@ -527,6 +528,55 @@
       <div class="lead-panel">
         <h2>单据剩余预留 / 领料详情</h2>
         <div id="issueDetail" class="hint">在左侧选择已确认单据，查看各规格尚未领出的预留量并分次领料。</div>
+      </div>
+    </section>
+  </main>
+
+  <!-- ============ 瑕疵隔离视图 ============ -->
+  <main id="viewQuarantine" class="view" hidden>
+    <aside class="panel">
+      <section>
+        <h2>① 玻璃原片隔离 / 解除</h2>
+        <div class="hint">发现原片瑕疵时，勾选一种或多种<b>已登记颜色</b>，提交隔离（hold）或解除隔离（release）的<b>正整数张数</b>、<b>非空原因</b>与<b>唯一操作号</b>。实物库存不因隔离变化；隔离只从新裁片订单与整套单的可用量中扣除。隔离只能划出当前<b>未预留且未隔离</b>的实物，解除不得超过隔离余额；未知颜色、非法数量或任一颜色余额不足时整次不生效。</div>
+        <label>操作
+          <select id="qAction">
+            <option value="hold">隔离（瑕疵封存）</option>
+            <option value="release">解除隔离（恢复可用）</option>
+          </select>
+        </label>
+        <label>唯一操作号
+          <input id="qOpNo" type="text" placeholder="如 Q-20261005-001" maxlength="80">
+        </label>
+        <label>原因（必填，≤200 字）
+          <textarea id="qReason" rows="2" placeholder="如：边角气泡、结石；解除原因：复检合格"></textarea>
+        </label>
+        <h3>选择颜色与本次张数</h3>
+        <div id="qColorList"></div>
+        <div class="btn-row">
+          <button id="btnQSubmit" class="primary big">提交（原子生效）</button>
+          <button id="btnQNewNo">生成操作号</button>
+        </div>
+        <div id="qMsg" class="hint">同一操作号同内容重试返回原记录，内容不同报冲突；已提交记录不可变、不可取消。</div>
+      </section>
+
+      <section>
+        <h2>② 隔离历史</h2>
+        <label>筛选颜色
+          <select id="qFilterSpec"><option value="">全部颜色</option></select>
+        </label>
+        <div id="qHistory"></div>
+      </section>
+    </aside>
+
+    <section class="canvas-wrap">
+      <div id="qBanner" class="banner" hidden></div>
+      <div class="lead-panel">
+        <h2>各色隔离余额与实际可用量</h2>
+        <div id="qBalances" class="hint">进入本页自动加载已登记颜色原片。</div>
+      </div>
+      <div class="lead-panel">
+        <h2>本次操作详情</h2>
+        <div id="qDetail" class="hint">在左侧选择颜色、张数与原因后提交，结果显示在这里。</div>
       </div>
     </section>
   </main>

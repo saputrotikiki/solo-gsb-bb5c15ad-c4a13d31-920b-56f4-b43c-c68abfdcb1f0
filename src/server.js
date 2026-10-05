@@ -1046,7 +1046,15 @@ app.patch('/api/glass-sheets/:sheetId', (req, res) => {
   }
   const r = db.updateGlassSheetStock(sheet.id, stock);
   if (r.code === 'stock_below_reserved') {
-    return fail(res, 409, `库存不得小于已确认订单预留张数（${r.reserved}）`, { reserved: r.reserved });
+    const floor = r.floor;
+    const detail = r.quarantined > 0
+      ? `（净预留 ${r.reserved} + 瑕疵隔离 ${r.quarantined} = ${floor} 张）`
+      : `（${r.reserved} 张）`;
+    return res.status(409).json({
+      ok: false, code: 'stock_below_reserved',
+      error: `库存不得小于净预留与瑕疵隔离量之和${detail}`,
+      reserved: r.reserved, quarantined: r.quarantined, floor,
+    });
   }
   res.json({ ok: true, sheet: r.sheet });
 });
@@ -1102,6 +1110,7 @@ function colorSummaries(layout, specs) {
     const stock = spec ? spec.stock : 0;
     const sheet = spec ? db.getGlassSheet(spec.id) : null;
     const reserved = sheet ? sheet.reserved : 0;
+    const quarantined = sheet ? sheet.quarantined : 0;
     const available = sheet ? sheet.available : 0;
     return {
       color: c.color,
@@ -1111,6 +1120,7 @@ function colorSummaries(layout, specs) {
       requiredSheets: c.requiredSheets,
       stock,
       reserved,
+      quarantined,
       available,
       shortage: Math.max(0, c.requiredSheets - available),
     };
@@ -1433,7 +1443,8 @@ function replacementColorRows(order, newLayout, specs) {
     const spec = specs.get(color);
     const sheet = spec ? db.getGlassSheet(spec.id) : null;
     const reserved = sheet ? sheet.reserved : 0; // 当前全部已确认单预留（含旧单）
-    const availableAfter = sheet ? sheet.stock - (reserved - oldSheets) : 0;
+    const quarantined = sheet ? sheet.quarantined : 0; // 瑕疵隔离量（不因换单变化）
+    const availableAfter = sheet ? sheet.stock - (reserved - oldSheets) - quarantined : 0;
     return {
       color,
       sheetId: spec ? spec.id : null,
@@ -1444,6 +1455,7 @@ function replacementColorRows(order, newLayout, specs) {
       netChange: requiredSheets - oldSheets,
       stock: sheet ? sheet.stock : 0,
       reserved,
+      quarantined,
       availableAfter,
       shortage: Math.max(0, requiredSheets - availableAfter),
     };
@@ -2085,8 +2097,9 @@ function parseStocktakeItems(body) {
 }
 
 // 盘点项输出：
-//   记录口径（永久）：预览基准 stock/reserved、实盘 counted、差异 diff、实盘后可用量 availableAfterCount；
-//   实时口径（current*）：确认前若库存/预留已漂移可直接看出；确认后反映盘点后的库存。
+//   记录口径（永久）：预览基准 stock/reserved/quarantined、实盘 counted、差异 diff、
+//   实盘后可用量 availableAfterCount（玻璃再扣除瑕疵隔离量）；
+//   实时口径（current*）：确认前若库存/预留/隔离已漂移可直接看出；确认后反映盘点后的库存。
 function serializeStocktakeItem(row) {
   const base = {
     itemId: row.id,
@@ -2094,9 +2107,10 @@ function serializeStocktakeItem(row) {
     specId: row.spec_id,
     counted: row.counted_stock,
     stock: row.baseline_stock,          // 预览时系统库存（记录原值）
-    reserved: row.baseline_reserved,    // 预览时已确认预留
+    reserved: row.baseline_reserved,    // 预览时已确认净预留
+    quarantined: row.baseline_quarantined || 0, // 预览时瑕疵隔离余额（铅条恒 0）
     diff: row.counted_stock - row.baseline_stock,
-    availableAfterCount: row.counted_stock - row.baseline_reserved,
+    availableAfterCount: row.counted_stock - row.baseline_reserved - (row.baseline_quarantined || 0),
   };
   if (row.type === 'lead') {
     const length = row.spec_length_h === null ? null : row.spec_length_h / 100;
@@ -2131,6 +2145,7 @@ function serializeStocktakeItem(row) {
       height: live.height,
       currentStock: live.stock,
       currentReserved: live.reserved,
+      currentQuarantined: live.quarantined,
       currentAvailable: live.available,
     };
   }
@@ -2140,7 +2155,7 @@ function serializeStocktakeItem(row) {
     color: row.spec_name,
     width: row.spec_width_mm,
     height: row.spec_height_mm,
-    currentStock: null, currentReserved: null, currentAvailable: null,
+    currentStock: null, currentReserved: null, currentQuarantined: null, currentAvailable: null,
     unavailable: true,
   };
 }
@@ -2249,7 +2264,8 @@ app.post('/api/stocktakes/:id/confirm', (req, res) => {
       spec_changed: '规格身份与预览基准不一致',
       stock_changed: '系统库存与预览基准不符',
       reserved_changed: '已确认预留与预览基准不符',
-      below_reserved: '实盘数低于当前预留',
+      quarantined_changed: '瑕疵隔离量与预览基准不符',
+      below_reserved: '实盘数低于当前净预留与隔离量之和',
     };
     return res.status(409).json({
       ok: false,
@@ -2274,6 +2290,185 @@ app.delete('/api/stocktakes/:id', (req, res) => {
     return fail(res, 409, '已确认盘点单为永久记录，不能删除（仅可查阅）');
   }
   res.json({ ok: true });
+});
+
+// ---------- 玻璃原片瑕疵隔离（隔离 / 解除隔离，不可变记录 + 台账） ----------
+
+const QUARANTINE_OP_NO_RE = /^[A-Za-z0-9._:一-龥-]{1,80}$/;
+const QUARANTINE_REASON_MAX = 200;
+
+function quarantineActionZh(action) {
+  return action === 'hold' ? '隔离' : '解除隔离';
+}
+
+// 解析隔离请求：
+//   { opNo, action:'hold'|'release', reason, items:[{sheetId 或 color, count}] }
+// 规则：opNo 必填且唯一（重试复用同值）；action 仅 hold/release；reason 非空（≤200 字）；
+//   items 至少一项，颜色必须已登记且不得重复，count 为正整数。
+// 返回 { error,status,code } 或 { params:{ opNo, action, reason, colors:Map } }。
+function parseQuarantineBody(body) {
+  const b = body || {};
+  const opNo = typeof b.opNo === 'string' ? b.opNo.trim() : '';
+  if (!QUARANTINE_OP_NO_RE.test(opNo)) {
+    return { error: 'opNo（唯一操作号）必填：1–80 个字母/数字/汉字/._:-，网络重试请复用同一值', code: 'invalid_op_no' };
+  }
+  const action = b.action === 'hold' || b.action === 'release' ? b.action : null;
+  if (!action) {
+    return { error: 'action 必须是 "hold"（隔离）或 "release"（解除隔离）' };
+  }
+  const reason = typeof b.reason === 'string' ? b.reason.trim() : '';
+  if (!reason) return { error: '隔离/解除必须填写非空原因 reason' };
+  if (reason.length > QUARANTINE_REASON_MAX) {
+    return { error: `原因最长 ${QUARANTINE_REASON_MAX} 个字符` };
+  }
+  const rawItems = b.items;
+  if (!Array.isArray(rawItems) || rawItems.length === 0) {
+    return { error: 'items 必填：至少选择一种已登记颜色，形如 [{sheetId 或 color, count}]' };
+  }
+  const colors = new Map();
+  for (const raw of rawItems) {
+    if (!raw || typeof raw !== 'object') {
+      return { error: '每个颜色项必须是对象 {sheetId 或 color, count}' };
+    }
+    const count = Number(raw.count);
+    if (!Number.isInteger(count) || count <= 0) {
+      return { error: '各色张数必须是正整数（≥1）' };
+    }
+    let sheetId = null;
+    if (raw.sheetId !== undefined) {
+      sheetId = Number(raw.sheetId);
+      if (!Number.isInteger(sheetId) || sheetId <= 0) {
+        return { error: 'sheetId 必须是玻璃原片规格的正整数 id' };
+      }
+      if (!db.getGlassSheetRow(sheetId)) {
+        return { error: `玻璃原片规格 #${sheetId} 不存在（未知颜色/规格，整次不生效）`, status: 404, code: 'sheet_not_found', sheetId };
+      }
+    } else if (typeof raw.color === 'string' && raw.color.trim()) {
+      const color = raw.color.trim().toLowerCase();
+      if (!COLOR_RE.test(color)) return { error: '颜色必须是 #RRGGBB 形式' };
+      const row = db.getGlassSheetByColorRow(color);
+      if (!row) {
+        return { error: `颜色 ${color} 的原片规格未登记（未知颜色，整次不生效）`, status: 404, code: 'color_not_registered', color };
+      }
+      sheetId = row.id;
+    } else {
+      return { error: '每个颜色项必须提供 sheetId 或 color' };
+    }
+    if (colors.has(sheetId)) {
+      return { error: `颜色规格 #${sheetId} 在同一次操作中重复出现（每种颜色只能出现一次）`, code: 'duplicate_color' };
+    }
+    colors.set(sheetId, count);
+  }
+  return { params: { opNo, action, reason, colors } };
+}
+
+function serializeQuarantineDetail(q) {
+  return {
+    id: q.id,
+    opNo: q.opNo,
+    action: q.action,
+    actionText: quarantineActionZh(q.action),
+    reason: q.reason,
+    createdAt: q.createdAt,
+    items: q.items.map((it) => {
+      const sheet = db.getGlassSheet(it.sheetId);
+      return {
+        sheetId: it.sheetId,
+        color: it.color,
+        count: it.count,
+        balanceQuarantined: it.balanceQuarantined,
+        stock: sheet ? sheet.stock : null,
+        reserved: sheet ? sheet.reserved : null,
+        available: sheet ? sheet.available : null,
+      };
+    }),
+  };
+}
+
+// POST /api/glass-quarantines —— 提交隔离/解除隔离（同事务原子写不可变记录、隔离量与台账）
+app.post('/api/glass-quarantines', (req, res) => {
+  const parsed = parseQuarantineBody(req.body);
+  if (parsed.error) {
+    return res.status(parsed.status || 400).json({
+      ok: false, error: parsed.error,
+      code: parsed.code || 'invalid_quarantine',
+      color: parsed.color, sheetId: parsed.sheetId,
+    });
+  }
+  const p = parsed.params;
+  const r = db.createGlassQuarantine(p);
+  if (r.code === 'idempotent') {
+    const q = db.getQuarantineDetail(r.id);
+    return res.status(200).json({
+      ok: true, idempotent: true,
+      message: `操作号 ${p.opNo} 已提交过且内容一致：返回原${quarantineActionZh(p.action)}记录，未重复变更隔离量`,
+      quarantine: serializeQuarantineDetail(q),
+    });
+  }
+  if (r.code === 'op_no_conflict') {
+    return res.status(409).json({
+      ok: false, code: 'op_no_conflict', opNo: p.opNo,
+      error: `同一操作号 ${p.opNo} 已用于内容不同的操作；请核对后使用新的操作号（本次未生效）`,
+      existing: {
+        action: r.existing.action,
+        actionText: quarantineActionZh(r.existing.action),
+        reason: r.existing.reason,
+        colors: r.existing.colors,
+      },
+    });
+  }
+  if (r.code === 'sheet_missing') {
+    return fail(res, 404, `玻璃原片规格 #${r.sheetId} 不存在（整次未生效）`);
+  }
+  if (r.code === 'shortage') {
+    return res.status(409).json({
+      ok: false,
+      code: 'shortage',
+      error: p.action === 'hold'
+        ? '部分颜色可隔离的未预留实物不足（隔离只能划出当前未预留且未隔离的实物），整次未生效'
+        : '部分颜色解除数量超过隔离余额，整次未生效',
+      problems: r.problems.map((pr) => ({
+        ...pr,
+        reasonText: pr.reason === 'over_free'
+          ? `可隔离量仅 ${pr.available} 张（实物 ${pr.stock} − 净预留 ${pr.reserved} − 已隔离 ${pr.quarantined}），本次 ${pr.requested} 张`
+          : `隔离余额仅 ${pr.quarantined} 张，本次解除 ${pr.requested} 张`,
+      })),
+    });
+  }
+  const q = db.getQuarantineDetail(r.id);
+  res.status(201).json({ ok: true, idempotent: false, quarantine: serializeQuarantineDetail(q) });
+});
+
+// 隔离历史：?sheetId=N（或 ?color=#rrggbb）可只看某颜色；?opNo=... 按操作号精确查
+app.get('/api/glass-quarantines', (req, res) => {
+  const q = req.query || {};
+  if (q.opNo) {
+    const rec = db.getQuarantineByOpNo(String(q.opNo));
+    if (!rec) return fail(res, 404, `操作号 ${q.opNo} 不存在`);
+    return res.json({ ok: true, quarantine: serializeQuarantineDetail(db.getQuarantineDetail(rec.id)) });
+  }
+  let sheetId = null;
+  if (q.sheetId !== undefined) {
+    sheetId = Number(q.sheetId);
+    if (!Number.isInteger(sheetId) || sheetId <= 0) return fail(res, 400, 'sheetId 必须是正整数');
+    if (!db.getGlassSheetRow(sheetId)) return fail(res, 404, `玻璃原片规格 #${sheetId} 不存在`);
+  } else if (q.color) {
+    const color = String(q.color).trim().toLowerCase();
+    if (!COLOR_RE.test(color)) return fail(res, 400, '颜色必须是 #RRGGBB 形式');
+    const row = db.getGlassSheetByColorRow(color);
+    if (!row) return fail(res, 404, `颜色 ${color} 的原片规格未登记`);
+    sheetId = row.id;
+  }
+  const list = db.listQuarantines({ sheetId }).map((h) => serializeQuarantineDetail(db.getQuarantineDetail(h.id)));
+  res.json({ ok: true, count: list.length, quarantines: list });
+});
+
+app.get('/api/glass-quarantines/:id', (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) return fail(res, 400, '隔离记录 id 必须是正整数');
+  const q = db.getQuarantineDetail(id);
+  if (!q) return fail(res, 404, '隔离记录不存在');
+  res.json({ ok: true, quarantine: serializeQuarantineDetail(q) });
 });
 
 // ---------- 领料（按已确认独立计划 / 独立裁片订单 / 整套单分次领料） ----------
@@ -2746,6 +2941,8 @@ const LEDGER_EVENT_TEXT = {
   combo_cancel: '整套单取消',
   stocktake: '盘点确认',
   issue: '领料出库',
+  quarantine_hold: '玻璃瑕疵隔离',
+  quarantine_release: '解除玻璃隔离',
 };
 
 // 解析时间边界：支持 YYYY-MM-DD / YYYY-MM-DD HH:MM / YYYY-MM-DD HH:MM:SS（空格或 T 分隔）。
@@ -2804,8 +3001,10 @@ app.get('/api/ledger', (req, res) => {
     sourceLabel: r.source_label,
     deltaStock: r.delta_stock,
     deltaReserved: r.delta_reserved,
+    deltaQuarantined: r.delta_quarantined ?? 0,
     balanceStock: r.balance_stock,
     balanceReserved: r.balance_reserved,
+    balanceQuarantined: r.balance_quarantined ?? 0,
   }));
   res.json({
     ok: true,
@@ -2818,7 +3017,12 @@ app.get('/api/ledger', (req, res) => {
       unit: type === 'lead' ? '根' : '张',
       from,
       to,
-      current: { stock: spec.stock, reserved: spec.reserved, available: spec.available },
+      current: {
+        stock: spec.stock,
+        reserved: spec.reserved,
+        quarantined: type === 'glass' ? (spec.quarantined || 0) : 0,
+        available: spec.available,
+      },
       count: entries.length,
       entries,
     },

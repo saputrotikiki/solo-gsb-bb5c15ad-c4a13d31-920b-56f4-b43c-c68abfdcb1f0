@@ -715,6 +715,7 @@ function switchTab(which) {
   document.getElementById('tabCombo').classList.toggle('active', which === 'combo');
   document.getElementById('tabStocktake').classList.toggle('active', which === 'stocktake');
   document.getElementById('tabIssue').classList.toggle('active', which === 'issue');
+  document.getElementById('tabQuarantine').classList.toggle('active', which === 'quarantine');
   document.getElementById('tabLedger').classList.toggle('active', which === 'ledger');
   document.getElementById('viewDraft').hidden = which !== 'draft';
   document.getElementById('viewPublished').hidden = which !== 'published';
@@ -726,6 +727,7 @@ function switchTab(which) {
   document.getElementById('viewCombo').hidden = which !== 'combo';
   document.getElementById('viewStocktake').hidden = which !== 'stocktake';
   document.getElementById('viewIssue').hidden = which !== 'issue';
+  document.getElementById('viewQuarantine').hidden = which !== 'quarantine';
   document.getElementById('viewLedger').hidden = which !== 'ledger';
   if (which === 'published') loadPubVersions();
   if (which === 'reuse') enterReuse();
@@ -736,6 +738,7 @@ function switchTab(which) {
   if (which === 'combo') enterCombo();
   if (which === 'stocktake') enterStocktake();
   if (which === 'issue') enterIssue();
+  if (which === 'quarantine') enterQuarantine();
   if (which === 'ledger') enterLedger();
 }
 
@@ -1704,7 +1707,7 @@ function renderGlassList() {
     el.innerHTML = '<div class="hint">尚未登记颜色原片。每种颜色仅可登记一种宽×高规格。</div>';
     return;
   }
-  let html = '<table><thead><tr><th>颜色</th><th class="num">宽×高</th><th class="num">库存</th><th class="num">已领</th><th class="num">未领预留</th><th class="num">可用</th><th></th></tr></thead><tbody>';
+  let html = '<table><thead><tr><th>颜色</th><th class="num">宽×高</th><th class="num">库存</th><th class="num">已领</th><th class="num">未领预留</th><th class="num">瑕疵隔离</th><th class="num">可用</th><th></th></tr></thead><tbody>';
   for (const s of cut.sheets) {
     html += `<tr>
       <td><span class="color-chip" style="background:${s.color}"></span>${s.color}</td>
@@ -1712,6 +1715,7 @@ function renderGlassList() {
       <td class="num">${s.stock}</td>
       <td class="num">${s.picked || 0}</td>
       <td class="num">${s.reserved}</td>
+      <td class="num${s.quarantined > 0 ? ' neg-text' : ''}">${s.quarantined || 0}</td>
       <td class="num"><b>${s.available}</b></td>
       <td><input type="number" min="0" step="1" value="${s.stock}" class="glass-stock" data-id="${s.id}" style="width:72px"></td>
     </tr>`;
@@ -1857,7 +1861,7 @@ function renderCutDetail(mode) {
       总裁片数 <b>${p.totalSheets}</b> / ${p.maxSheets} 张</div></div>`;
   html += cutStockBadge(p, isPreview);
 
-  html += '<div class="cut-color-summary"><table><thead><tr><th>颜色</th><th class="num">原片宽×高</th><th class="num">用板</th><th class="num">库存</th><th class="num">已预留</th><th class="num">可用</th><th class="num">缺口</th></tr></thead><tbody>';
+  html += '<div class="cut-color-summary"><table><thead><tr><th>颜色</th><th class="num">原片宽×高</th><th class="num">用板</th><th class="num">库存</th><th class="num">已预留</th><th class="num">瑕疵隔离</th><th class="num">可用</th><th class="num">缺口</th></tr></thead><tbody>';
   for (const c of p.colors) {
     html += `<tr>
       <td><span class="color-chip" style="background:${c.color}"></span>${c.color}</td>
@@ -1865,6 +1869,7 @@ function renderCutDetail(mode) {
       <td class="num"><b>${c.requiredSheets}</b></td>
       <td class="num">${c.stock}</td>
       <td class="num">${c.reserved}</td>
+      <td class="num">${c.quarantined || 0}</td>
       <td class="num">${c.available}</td>
       <td class="num">${c.shortage > 0 ? `<span class="gap-info">${c.shortage}</span>` : 0}</td>
     </tr>`;
@@ -2340,7 +2345,7 @@ function renderComboPreview(p) {
       ${glassOk ? '✓ 各色原片库存充足' : '⚠ 部分颜色缺口：' +
         p.glass.colors.filter((c) => c.shortage > 0).map((c) => `${c.color} 缺 ${c.shortage}`).join('；')}
     </div>`;
-  html += '<div class="cut-color-summary"><table><thead><tr><th>颜色</th><th class="num">原片宽×高</th><th class="num">用板</th><th class="num">库存</th><th class="num">已预留</th><th class="num">可用</th><th class="num">缺口</th></tr></thead><tbody>';
+  html += '<div class="cut-color-summary"><table><thead><tr><th>颜色</th><th class="num">原片宽×高</th><th class="num">用板</th><th class="num">库存</th><th class="num">已预留</th><th class="num">瑕疵隔离</th><th class="num">可用</th><th class="num">缺口</th></tr></thead><tbody>';
   for (const c of p.glass.colors) {
     html += `<tr>
       <td><span class="color-chip" style="background:${c.color}"></span>${c.color}</td>
@@ -2348,6 +2353,7 @@ function renderComboPreview(p) {
       <td class="num"><b>${c.requiredSheets}</b></td>
       <td class="num">${c.stock}</td>
       <td class="num">${c.reserved}</td>
+      <td class="num">${c.quarantined || 0}</td>
       <td class="num">${c.available}</td>
       <td class="num">${c.shortage > 0 ? `<span class="gap-info">${c.shortage}</span>` : 0}</td>
     </tr>`;
@@ -2727,7 +2733,7 @@ function stRenderDetail(s) {
   }
   if (glassItems.length) {
     html += '<h3>玻璃原片</h3>' + tableHead([
-      { t: '颜色' }, { t: '系统库存(原)', num: 1 }, { t: '已确认预留', num: 1 },
+      { t: '颜色' }, { t: '系统库存(原)', num: 1 }, { t: '已确认预留', num: 1 }, { t: '瑕疵隔离', num: 1 },
       { t: '实盘总数', num: 1 }, { t: '差异', num: 1 }, { t: '实盘后可用', num: 1 },
     ]);
     for (const it of glassItems) {
@@ -2736,6 +2742,7 @@ function stRenderDetail(s) {
           <span class="muted small">${it.width}×${it.height} mm</span></td>
         <td class="num">${it.stock}</td>
         <td class="num">${it.reserved}</td>
+        <td class="num">${it.quarantined || 0}</td>
         <td class="num"><b>${it.counted}</b></td>
         <td class="num">${stDiffCell(it.diff)}</td>
         <td class="num"><b>${it.availableAfterCount}</b></td>
@@ -2744,8 +2751,8 @@ function stRenderDetail(s) {
     html += '</tbody></table>';
   }
 
-  html += `<div class="hint small">系统库存/已确认预留/差异/实盘后可用量为<b>预览基准口径</b>（确认时即盘点口径）；
-    “实盘后可用 = 实盘总数 − 已确认预留”，独立计划、裁片订单与整套单随后按该口径计算。</div>`;
+  html += `<div class="hint small">系统库存/已确认预留/瑕疵隔离/差异/实盘后可用量为<b>预览基准口径</b>（确认时即盘点口径）；
+    “实盘后可用 = 实盘总数 − 已确认预留 − 瑕疵隔离”，独立计划、裁片订单与整套单随后按该口径计算。</div>`;
 
   if (s.status === 'draft') {
     html += `<div class="btn-row">
@@ -2993,6 +3000,192 @@ document.getElementById('btnIssueNewNo').addEventListener('click', () => {
   document.getElementById('issueNo').value = genIssueNo();
 });
 
+// ================= 玻璃原片瑕疵隔离（隔离 / 解除隔离） =================
+
+const quar = { sheets: [], history: [] };
+
+function qBanner(kind, msg) {
+  const b = document.getElementById('qBanner');
+  if (!kind) { b.hidden = true; b.textContent = ''; return; }
+  b.className = `banner ${kind === 'error' ? 'error' : 'success'}`;
+  b.hidden = false;
+  b.innerHTML = msg;
+  clearTimeout(qBanner._t);
+  if (kind === 'success') qBanner._t = setTimeout(() => { b.hidden = true; }, 5000);
+}
+
+function genQOpNo() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  const stamp = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+  return `Q-${stamp}-${Math.random().toString(36).slice(2, 6)}`.toUpperCase();
+}
+
+async function enterQuarantine() {
+  qBanner(false);
+  document.getElementById('qOpNo').value = genQOpNo();
+  await qLoadAll();
+}
+
+async function qLoadAll() {
+  await qLoadSheets();
+  await qLoadHistory();
+}
+
+async function qLoadSheets() {
+  const data = await api('GET', '/api/glass-sheets');
+  quar.sheets = data.sheets;
+  qRenderColorList();
+  qRenderBalances();
+  // 历史筛选下拉
+  const sel = document.getElementById('qFilterSpec');
+  const prev = sel.value;
+  sel.innerHTML = '<option value="">全部颜色</option>' + quar.sheets
+    .map((s) => `<option value="${s.id}">${s.color}（${s.width}×${s.height}mm）</option>`).join('');
+  sel.value = prev;
+}
+
+// 左侧：按当前操作（hold/release）渲染各色可输入行
+function qRenderColorList() {
+  const action = document.getElementById('qAction').value;
+  const el = document.getElementById('qColorList');
+  if (!quar.sheets.length) {
+    el.innerHTML = '<div class="hint">尚未登记任何颜色原片，请到“玻璃裁片”标签先登记。</div>';
+    return;
+  }
+  el.innerHTML = '<table><tbody>' + quar.sheets.map((s) => {
+    const free = s.stock - s.reserved - s.quarantined; // 未预留且未隔离
+    const hint = action === 'hold'
+      ? `可隔离 <b>${free}</b>（实物 ${s.stock} − 净预留 ${s.reserved} − 已隔离 ${s.quarantined}）`
+      : `隔离余额 <b>${s.quarantined}</b>`;
+    return `<tr>
+      <td><span class="color-chip" style="background:${s.color}"></span>${s.color}</td>
+      <td class="num muted small">${hint}</td>
+      <td><input type="number" min="1" step="1" value="0" data-q-sheet="${s.id}"
+            data-q-action-limit="${action === 'hold' ? free : s.quarantined}" style="width:72px"></td>
+    </tr>`;
+  }).join('') + '</tbody></table>';
+}
+
+// 右侧：各色隔离余额与实际可用量总表
+function qRenderBalances() {
+  const el = document.getElementById('qBalances');
+  if (!quar.sheets.length) { el.innerHTML = '<div class="hint">暂无已登记颜色原片。</div>'; return; }
+  let html = `<div class="hint">实际可用量 = 实物库存 − 净预留（未领预留）− 瑕疵隔离；新裁片订单与整套单按此口径扣减隔离量。</div>
+    <table><thead><tr>
+      <th>颜色</th><th class="num">原片宽×高</th><th class="num">实物库存</th>
+      <th class="num">净预留</th><th class="num">隔离余额</th><th class="num">实际可用</th>
+    </tr></thead><tbody>`;
+  for (const s of quar.sheets) {
+    html += `<tr>
+      <td><span class="color-chip" style="background:${s.color}"></span>${s.color}</td>
+      <td class="num">${s.width}×${s.height}</td>
+      <td class="num">${s.stock}</td>
+      <td class="num">${s.reserved}</td>
+      <td class="num${s.quarantined > 0 ? ' neg-text' : ''}"><b>${s.quarantined}</b></td>
+      <td class="num"><b>${s.available}</b></td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  el.innerHTML = html;
+}
+
+async function qLoadHistory() {
+  const specId = document.getElementById('qFilterSpec').value;
+  const url = '/api/glass-quarantines' + (specId ? `?sheetId=${specId}` : '');
+  const data = await api('GET', url);
+  quar.history = data.quarantines;
+  const el = document.getElementById('qHistory');
+  if (!quar.history.length) { el.innerHTML = '<div class="hint">暂无隔离记录。</div>'; return; }
+  el.innerHTML = '<ul class="issue-records">' + quar.history.map(qRecordHtml).join('') + '</ul>';
+}
+
+function qRecordHtml(q) {
+  const badge = q.action === 'hold'
+    ? '<span class="badge bad">隔离</span>'
+    : '<span class="badge ok">解除</span>';
+  const parts = q.items.map((it) =>
+    `<span class="color-chip" style="background:${it.color}"></span>${it.color} <b>${it.count}</b> 张（笔后隔离 ${it.balanceQuarantined}）`);
+  return `<li class="q-record" data-q-id="${q.id}">${badge} <code>${escapeHtml(q.opNo)}</code>
+    <span class="muted small">${q.createdAt}</span><br>
+    <span class="muted small">原因：${escapeHtml(q.reason)}</span><br>${parts.join('　')}</li>`;
+}
+
+function qRenderDetail(q) {
+  const el = document.getElementById('qDetail');
+  let html = `<div class="plan-head">
+    <div><b>操作 #${q.id} · ${q.actionText}</b>
+      <span class="badge ${q.action === 'hold' ? 'bad' : 'ok'}">${q.actionText}</span>
+      <code>${escapeHtml(q.opNo)}</code></div>
+    <div class="muted">${q.createdAt} · 原因：${escapeHtml(q.reason)}</div></div>
+    <table><thead><tr><th>颜色</th><th class="num">本次${q.actionText}</th><th class="num">笔后隔离余额</th>
+      <th class="num">实物库存</th><th class="num">净预留</th><th class="num">实际可用</th></tr></thead><tbody>`;
+  for (const it of q.items) {
+    html += `<tr>
+      <td><span class="color-chip" style="background:${it.color}"></span>${it.color}</td>
+      <td class="num"><b>${it.count}</b></td>
+      <td class="num"><b>${it.balanceQuarantined}</b></td>
+      <td class="num">${it.stock === null ? '—' : it.stock}</td>
+      <td class="num">${it.reserved === null ? '—' : it.reserved}</td>
+      <td class="num">${it.available === null ? '—' : it.available}</td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  el.innerHTML = html;
+}
+
+async function qSubmit() {
+  const action = document.getElementById('qAction').value;
+  const opNo = document.getElementById('qOpNo').value.trim();
+  const reason = document.getElementById('qReason').value.trim();
+  if (!opNo) { qBanner('error', '⛔ 请填写唯一操作号（可点“生成操作号”）'); return; }
+  if (!reason) { qBanner('error', '⛔ 请填写非空原因'); return; }
+  const items = [];
+  let bad = false;
+  document.querySelectorAll('[data-q-sheet]').forEach((inp) => {
+    const n = Number(inp.value);
+    if (!Number.isInteger(n) || n < 0) { bad = true; return; }
+    if (n > 0) items.push({ sheetId: Number(inp.dataset.qSheet), count: n });
+  });
+  if (bad) { qBanner('error', '⛔ 各色张数必须是非负整数（要操作的颜色请填正整数，其余保持 0）'); return; }
+  if (!items.length) { qBanner('error', '⛔ 请至少为一种颜色填写正整数张数'); return; }
+  try {
+    const data = await api('POST', '/api/glass-quarantines', { opNo, action, reason, items });
+    qRenderDetail(data.quarantine);
+    const parts = data.quarantine.items.map((it) => `${it.color} ${it.count} 张（笔后隔离 ${it.balanceQuarantined}）`);
+    qBanner('success',
+      (data.idempotent ? `操作号 ${opNo} 已提交过：返回原记录（未重复变更）。<br>` : '✓ 操作已原子生效（实物库存不变，已写不可变记录与台账）。<br>') +
+      parts.join('；'));
+    document.getElementById('qOpNo').value = genQOpNo();
+    document.getElementById('qReason').value = '';
+    await qLoadAll();
+  } catch (err) {
+    const d = err.data || {};
+    let txt = '⛔ ' + (d.error || err.message);
+    if (d.code === 'shortage' && Array.isArray(d.problems)) {
+      txt += '<br>' + d.problems.map((p) => escapeHtml(p.reasonText)).join('<br>');
+      txt += '<br>整次操作未生效，未写任何记录。';
+    }
+    if (d.code === 'op_no_conflict') txt += '；请更换操作号。';
+    qBanner('error', txt);
+    await qLoadAll();
+  }
+}
+
+document.getElementById('tabQuarantine').addEventListener('click', () => switchTab('quarantine'));
+document.getElementById('qAction').addEventListener('change', qRenderColorList);
+document.getElementById('qFilterSpec').addEventListener('change', qLoadHistory);
+document.getElementById('btnQSubmit').addEventListener('click', () => { qSubmit().catch((e) => qBanner('error', '⛔ ' + e.message)); });
+document.getElementById('btnQNewNo').addEventListener('click', () => {
+  document.getElementById('qOpNo').value = genQOpNo();
+});
+document.getElementById('qHistory').addEventListener('click', async (e) => {
+  const li = e.target.closest('.q-record');
+  if (!li) return;
+  const data = await api('GET', `/api/glass-quarantines/${li.dataset.qId}`);
+  qRenderDetail(data.quarantine);
+});
+
 // ================= 库存台账（按规格追溯实物库存与净预留） =================
 
 const ledger = {
@@ -3030,7 +3223,7 @@ async function ledgerLoadSpecs() {
   sel.innerHTML = ledger.specs.map((s) => {
     const label = ledger.type === 'lead'
       ? `#${s.id} ${s.name}（定尺 ${fmt(s.length)}mm · 库存 ${s.stock} / 净预留 ${s.reserved}）`
-      : `#${s.id} ${s.color}（${s.width}×${s.height}mm · 库存 ${s.stock} / 净预留 ${s.reserved}）`;
+      : `#${s.id} ${s.color}（${s.width}×${s.height}mm · 库存 ${s.stock} / 净预留 ${s.reserved} / 隔离 ${s.quarantined || 0}）`;
     return `<option value="${s.id}">${escapeHtml(label)}</option>`;
   }).join('');
 }
@@ -3061,11 +3254,14 @@ function ledgerDeltaHtml(n) {
 function ledgerRender() {
   const L = ledger.result;
   if (!L) return;
+  const isGlass = L.materialType === 'glass';
   document.getElementById('ledgerCurrentSection').hidden = false;
   document.getElementById('ledgerCurrent').innerHTML =
     `<div class="stock-badge ok">${escapeHtml(L.materialTypeText)} ${escapeHtml(L.specName)}
       <span class="muted small">${escapeHtml(L.specDetail)}</span><br>
-      实物库存 <b>${L.current.stock}</b> ${L.unit} · 净预留 <b>${L.current.reserved}</b> · 可用 <b>${L.current.available}</b>
+      实物库存 <b>${L.current.stock}</b> ${L.unit} · 净预留 <b>${L.current.reserved}</b>${
+        isGlass ? ` · 瑕疵隔离 <b>${L.current.quarantined || 0}</b>` : ''
+      } · 可用 <b>${L.current.available}</b>
     </div>`;
   const el = document.getElementById('ledgerTable');
   if (!L.entries.length) {
@@ -3075,8 +3271,12 @@ function ledgerRender() {
   let html = `<div class="hint">共 ${L.count} 笔，按发生顺序排列；笔后余额可与当前结存逐笔核对。</div>
     <table><thead><tr>
       <th>#</th><th>发生时间</th><th>业务来源</th><th>事件</th>
-      <th class="num">实物增减</th><th class="num">净预留增减</th>
-      <th class="num">笔后实物</th><th class="num">笔后净预留</th>
+      <th class="num">实物增减</th><th class="num">净预留增减</th>${
+        isGlass ? '<th class="num">隔离增减</th>' : ''
+      }
+      <th class="num">笔后实物</th><th class="num">笔后净预留</th>${
+        isGlass ? '<th class="num">笔后隔离</th>' : ''
+      }
     </tr></thead><tbody>`;
   for (const e of L.entries) {
     html += `<tr>
@@ -3086,8 +3286,10 @@ function ledgerRender() {
       <td>${escapeHtml(e.eventText)}</td>
       ${ledgerDeltaHtml(e.deltaStock)}
       ${ledgerDeltaHtml(e.deltaReserved)}
+      ${isGlass ? ledgerDeltaHtml(e.deltaQuarantined || 0) : ''}
       <td class="num"><b>${e.balanceStock}</b></td>
       <td class="num"><b>${e.balanceReserved}</b></td>
+      ${isGlass ? `<td class="num"><b>${e.balanceQuarantined || 0}</b></td>` : ''}
     </tr>`;
   }
   html += '</tbody></table>';
